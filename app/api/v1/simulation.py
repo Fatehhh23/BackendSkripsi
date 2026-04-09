@@ -49,13 +49,9 @@ async def run_simulation(
         raise HTTPException(status_code=400, detail=str(e))
     
     # ============================================================
-    # ACCESS CONTROL: Mode AI hanya untuk user yang sudah login
+    # ACCESS CONTROL: AI Mode is now accessible to all users (guests)
     # ============================================================
-    if request_data.mode == "AI" and current_user is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Mode AI memerlukan autentikasi. Silakan login terlebih dahulu untuk menggunakan simulasi AI yang presisi."
-        )
+    # The previous auth requirement has been removed as per user request.
 
     try:
         # Initialize prediction service

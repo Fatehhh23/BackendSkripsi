@@ -32,8 +32,8 @@ echo   AVATAR Started Successfully!
 echo ========================================
 echo.
 echo Frontend: http://localhost:3000
-echo Backend:  http://localhost:8000
-echo pgAdmin:  http://localhost:5050
+echo Backend:  http://localhost:8001
+echo pgAdmin:  http://localhost:5051
 echo.
 echo Press any key to open browser...
 pause >nul

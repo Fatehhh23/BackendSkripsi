@@ -42,6 +42,7 @@ async def init_db():
         
             
             # Create all tables
+            from app.database import models
             await conn.run_sync(Base.metadata.create_all)
             
         logger.info("✅ Database initialized successfully")

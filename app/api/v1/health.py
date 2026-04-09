@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 from datetime import datetime
 import psutil
 
@@ -13,7 +14,7 @@ async def health_check(db: AsyncSession = Depends(get_db)):
     """Health check endpoint untuk monitoring"""
     try:
         # Check database connection
-        await db.execute("SELECT 1")
+        await db.execute(text("SELECT 1"))
         db_status = "connected"
     except Exception as e:
         db_status = f"error: {str(e)}"
