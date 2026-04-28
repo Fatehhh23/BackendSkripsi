@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with PostGIS
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: tsunami_db_v2
+    environment:
+      POSTGRES_USER: tsunami_user
+      POSTGRES_PASSWORD: tsunami_password
+      POSTGRES_DB: tsunami_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data_v2:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U tsunami_user -d tsunami_db" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Backend
+  backend:
+    build: .
+    container_name: tsunami_backend_v2
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8001:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://tsunami_user:tsunami_password@db:5432/tsunami_db
+      - DEBUG=True
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+      - ./trained_models:/app/trained_models
+      - ./make_admin.py:/app/make_admin.py
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # pgAdmin (optional, for database management)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: tsunami_pgadmin_v2
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@avatar.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5051:80"
+    depends_on:
+      - db
+    restart: unless-stopped
+
+volumes:
+  postgres_data_v2:
