@@ -182,51 +182,125 @@ class PredictionService:
 
     def _crop_dem_at_epicenter(self, lat: float, lon: float, size: int = 256) -> np.ndarray:
         """
-        Crop region size×size dari DEM raster, centered di epicenter (lat, lon).
-        Return array (size, size) float32 elevasi dalam meter.
+        Crop region size×size dari DEM asli, atau buat DEM sintetis jika
+        file GeoTIFF tidak tersedia.
         """
-        if self._dem_data is None:
-            return np.zeros((size, size), dtype=np.float32)
+        if self._dem_data is not None:
+            b  = self._dem_bounds
+            H, W = self._dem_shape
+            col_per_deg = W / (b.right - b.left)
+            row_per_deg = H / (b.top  - b.bottom)
+            center_col  = int((lon - b.left) * col_per_deg)
+            center_row  = int((b.top - lat)  * row_per_deg)
+            half = size // 2
+            r0 = max(0, center_row - half)
+            r1 = min(H, center_row + half)
+            c0 = max(0, center_col - half)
+            c1 = min(W, center_col + half)
+            res_lon = (b.right - b.left) / W
+            res_lat = (b.top  - b.bottom) / H
+            self._last_crop_bounds = {
+                "min_lon": b.left + c0 * res_lon,
+                "max_lon": b.left + c1 * res_lon,
+                "min_lat": b.top  - r1 * res_lat,
+                "max_lat": b.top  - r0 * res_lat,
+            }
+            crop = self._dem_data[r0:r1, c0:c1].copy()
+            if crop.shape != (size, size):
+                padded = np.zeros((size, size), dtype=np.float32)
+                ph = min(crop.shape[0], size)
+                pw = min(crop.shape[1], size)
+                padded[:ph, :pw] = crop[:ph, :pw]
+                crop = padded
+            return crop
+        else:
+            # DEM tidak ada → gunakan model sintetis berbasis geografi Selat Sunda
+            return self._create_synthetic_dem_sunda(lat, lon, size)
 
-        b = self._dem_bounds
-        H, W = self._dem_shape
+    def _create_synthetic_dem_sunda(self, lat_center: float, lon_center: float, size: int = 256) -> np.ndarray:
+        """
+        DEM sintetis geografi-aware untuk Selat Sunda.
+        Dipakai sebagai fallback ketika file GeoTIFF tidak tersedia.
 
-        # Konversi lon/lat → pixel row/col
-        col_per_deg = W / (b.right - b.left)
-        row_per_deg = H / (b.top - b.bottom)
+        Model terrain sederhana namun realistis:
+          - Selat (laut)    : elevasi negatif, lebih dalam di tengah
+          - Pantai Banten   : dataran rendah 0-10m kemudian naik gradual
+          - Pantai Lampung  : serupa tetapi lebih curam
+          - Zona shallow    : 0-5m di sepanjang garis pantai
 
-        center_col = int((lon - b.left) * col_per_deg)
-        center_row = int((b.top - lat) * row_per_deg)
+        Catatan: Anak Krakatau / pulau-pulau kecil tidak dimodelkan secara
+        eksplisit tetapi akan muncul sebagai puncak positif dalam noise.
+        """
+        from scipy.ndimage import gaussian_filter
 
-        half = size // 2
-        r0 = max(0, center_row - half)
-        r1 = min(H, center_row + half)
-        c0 = max(0, center_col - half)
-        c1 = min(W, center_col + half)
+        half_deg = 0.45           # ~50 km radius
+        lat_arr  = np.linspace(lat_center + half_deg, lat_center - half_deg, size)
+        lon_arr  = np.linspace(lon_center - half_deg, lon_center + half_deg, size)
+        lon_mesh, lat_mesh = np.meshgrid(lon_arr, lat_arr)
 
-        # Hitung bounds geografis aktual dari crop ini
-        # Karena kita melakukan max/min clamping di atas, bounds aslinya bisa bergeser.
-        res_lon = (b.right - b.left) / W
-        res_lat = (b.top - b.bottom) / H
-        
+        # Garis pantai utama Selat Sunda (approximate)
+        java_coast_lat    = -6.03    # pantai utara Jawa (Banten)
+        sumatra_coast_lat = -5.55    # pantai selatan Sumatera (Lampung)
+        strait_center_lat = (java_coast_lat + sumatra_coast_lat) / 2.0
+
+        java_land    = lat_mesh <= java_coast_lat
+        sumatra_land = lat_mesh >= sumatra_coast_lat
+        in_strait    = ~java_land & ~sumatra_land
+
+        dist_java     = np.abs(lat_mesh - java_coast_lat)
+        dist_sumatra  = np.abs(lat_mesh - sumatra_coast_lat)
+        dist_nearest  = np.minimum(dist_java, dist_sumatra)
+
+        elev = np.zeros((size, size), dtype=np.float32)
+
+        # Laut / Selat — makin ke tengah makin dalam
+        strait_hw = abs(java_coast_lat - sumatra_coast_lat) / 2.0
+        rel_pos   = np.abs(lat_mesh - strait_center_lat) / max(strait_hw, 0.01)
+        sea_depth = -160.0 * np.sqrt(np.clip(1.0 - rel_pos, 0, 1))
+        elev[in_strait] = sea_depth[in_strait]
+
+        # Zona dangkal (<1 km dari pantai) → -5 s/d 0 m
+        shallow = (dist_nearest < 0.010) & in_strait
+        t = dist_nearest[shallow] / 0.010        # 0 di pantai, 1 di batas zona
+        elev[shallow] = -5.0 * t
+
+        # Dataran Jawa/Banten: naik dari 0 di pantai → plateau ~50 m
+        # Zona 0-3 km: rata-rata 0-5 m (dataran pantai)
+        # Zona 3-15 km: naik ke 20-50 m (perbukitan)
+        d_java_km = dist_java * 111.0            # konversi ke km (approx)
+        elev_java = np.where(
+            d_java_km < 3.0,
+            d_java_km * 1.5,                     # ~1.5 m/km (dataran pantai rendah)
+            4.5 + (d_java_km - 3.0) * 4.0        # ~4 m/km setelah 3 km
+        )
+        elev[java_land] = np.clip(elev_java[java_land], 0, 100)
+
+        # Dataran Sumatera/Lampung: sedikit lebih curam
+        d_sum_km = dist_sumatra * 111.0
+        elev_sum = np.where(
+            d_sum_km < 2.0,
+            d_sum_km * 1.8,
+            3.6 + (d_sum_km - 2.0) * 5.0
+        )
+        elev[sumatra_land] = np.clip(elev_sum[sumatra_land], 0, 120)
+
+        # Variasi terrain lokal (bukit, lembah kecil)
+        rng   = np.random.default_rng(seed=int(abs(lat_center * 10000)))
+        noise = rng.normal(0, 1, (size, size)).astype(np.float32)
+        noise = gaussian_filter(noise, sigma=5) * 3.0
+        elev += noise
+        elev[java_land]    = np.maximum(0.0, elev[java_land])
+        elev[sumatra_land] = np.maximum(0.0, elev[sumatra_land])
+
+        # Simpan bounds untuk konversi piksel → koordinat geo
         self._last_crop_bounds = {
-            "min_lon": b.left + c0 * res_lon,
-            "max_lon": b.left + c1 * res_lon,
-            "min_lat": b.top - r1 * res_lat,
-            "max_lat": b.top - r0 * res_lat,
+            "min_lon": lon_center - half_deg,
+            "max_lon": lon_center + half_deg,
+            "min_lat": lat_center - half_deg,
+            "max_lat": lat_center + half_deg,
         }
 
-        crop = self._dem_data[r0:r1, c0:c1].copy()
-
-        # Pad jika crop lebih kecil dari size×size (epicenter dekat tepi)
-        if crop.shape != (size, size):
-            padded = np.zeros((size, size), dtype=np.float32)
-            ph = min(crop.shape[0], size)
-            pw = min(crop.shape[1], size)
-            padded[:ph, :pw] = crop[:ph, :pw]
-            crop = padded
-
-        return crop
+        return elev
 
     def _build_dem_tensor(
         self,
@@ -376,45 +450,45 @@ class PredictionService:
     # ──────────────────────────────────────────────
     def _seg_mask_to_inundation_zones(
         self,
-        seg_mask: np.ndarray,    # (256, 256) — kelas 0=Aman, 1=Waspada, 2=Bahaya
-        depth_map: np.ndarray,   # (256, 256) — kedalaman inundasi (m)
+        seg_mask: np.ndarray,
+        depth_map: np.ndarray,
     ) -> List[Dict]:
         """
-        Konversi segmentation mask 256x256 menjadi polygon GeoJSON
-        yang di-map ke bounding box Selat Sunda.
-
-        Menghasilkan hingga 3 zona inundasi (Bahaya, Waspada, Rendah)
-        berdasarkan threshold kedalaman.
+        Konversi depth map 256x256 menjadi polygon GeoJSON.
+        Menghasilkan 6 level zona genangan sesuai standar BMKG:
+          > 14m  = Bahaya Ekstrem   (merah tua)
+          10-14m = Bahaya Sangat Tinggi (merah)
+           6-10m = Bahaya Tinggi    (oranye tua)
+           3-6m  = Bahaya Sedang    (oranye)
+          0.5-3m = Bahaya Rendah    (kuning)
+         <0.5m  = Waspada           (hijau)
         """
         zones = []
-        b = self.GEO_BOUNDS
-
-        # Tentukan threshold kedalaman untuk 3 level zona
         max_depth = float(np.max(depth_map))
-        if max_depth < 0.1:
-            return zones   # Tidak ada inundasi signifikan
 
-        # Masked depth: hanya area non-aman
+        if max_depth < 0.05:
+            return zones
+
         active_mask = seg_mask > 0
         if not np.any(active_mask):
             return zones
 
-        # Buat 6 level zona berdasarkan kedalaman (standar peta bahaya tsunami)
+        # Threshold 6 level BMKG
         thresholds = [
-            (14.0, 100.0, "Bahaya Ekstrem"),  # Merah Tua (>14m)
-            (10.0, 14.0, "Bahaya Sangat Tinggi"), # Merah (10-14m)
-            (6.0, 10.0, "Bahaya Tinggi"),    # Oranye Tua (6-10m)
-            (3.0, 6.0, "Bahaya Sedang"),     # Oranye (3-6m)
-            (0.5, 3.0, "Bahaya Rendah"),     # Kuning (0.5-3m)
-            (0.05, 0.5, "Waspada"),          # Hijau (<0.5m)
+            (14.0, 9999.0),   # Bahaya Ekstrem
+            (10.0,  14.0),    # Bahaya Sangat Tinggi
+            ( 6.0,  10.0),    # Bahaya Tinggi
+            ( 3.0,   6.0),    # Bahaya Sedang
+            ( 0.5,   3.0),    # Bahaya Rendah
+            ( 0.05,  0.5),    # Waspada
         ]
 
-        for low_th, high_th, label in thresholds:
+        for low_th, high_th in thresholds:
             mask = active_mask & (depth_map >= low_th) & (depth_map < high_th)
             if not np.any(mask):
                 continue
 
-            mean_height = float(np.mean(depth_map[mask]))
+            mean_height  = float(np.mean(depth_map[mask]))
             polygon_rings = self._mask_to_polygon(mask)
 
             if polygon_rings:
